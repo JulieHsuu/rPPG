@@ -1,0 +1,8 @@
+{
+  "subjects": 4,
+  "rows": 4,
+  "minimum_subjects": 60,
+  "status": "insufficient_data",
+  "model_enabled": false,
+  "reason": "至少需要 60 位受試者；目前只有 4 位"
+}

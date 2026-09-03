@@ -6,7 +6,13 @@ node_modules/
 dist/
 .env
 .DS_Store
+.pnpm-store/
+frontend/site-deploy*.tar.gz
+frontend/.deploy-stage*/
 backend/models/*.pth
 backend/models/*.pt
 backend/models/*.onnx
 backend/models/*.ckpt
+backend/training/bp/data/
+backend/training/bp/features.csv
+backend/training/bp/bp_model.json

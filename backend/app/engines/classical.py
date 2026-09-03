@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
-from scipy.signal import butter, filtfilt, find_peaks, welch
+from scipy.signal import butter, filtfilt, find_peaks, hilbert, welch
 
 EngineName = Literal["pos", "chrom"]
 
@@ -14,6 +14,8 @@ class VitalEstimate:
     hr_bpm: float | None
     rr_bpm: float | None
     hrv_rmssd_ms: float | None
+    hrv_raw_ms: float | None
+    spo2_percent: float | None
     signal_quality: float
     waveform: list[float]
     engine: str
@@ -164,32 +166,129 @@ def _pulse_consensus(rgb: np.ndarray, fs: float, engine: EngineName) -> tuple[fl
     return rate, quality, primary
 
 
-def _estimate_hrv(filtered: np.ndarray, fs: float) -> float | None:
-    if filtered.size < int(fs * 12):
+def _estimate_hrv(filtered: np.ndarray, fs: float, hr_bpm: float | None) -> float | None:
+    if filtered.size < int(fs * 30):
         return None
-    prominence = max(np.std(filtered) * 0.25, 1e-6)
-    min_distance = max(1, int(fs * 60.0 / 180.0))
-    peaks, _ = find_peaks(filtered, distance=min_distance, prominence=prominence)
-    if peaks.size < 5:
+    if hr_bpm is None or not 40.0 <= hr_bpm <= 180.0:
         return None
-    ibi_ms = np.diff(peaks) / fs * 1000.0
-    ibi_ms = ibi_ms[(ibi_ms >= 333.0) & (ibi_ms <= 1500.0)]
-    if ibi_ms.size < 4:
+    center_hz = hr_bpm / 60.0
+    pulse = _safe_bandpass(
+        filtered, fs, max(0.70, center_hz - 0.42), min(3.0, center_hz + 0.42), order=2
+    )
+    prominence = max(np.std(pulse) * 0.20, 1e-6)
+    expected_samples = fs * 60.0 / hr_bpm
+    min_distance = max(1, int(expected_samples * 0.62))
+    candidates = []
+    for candidate_signal in (pulse, -pulse):
+        candidate_peaks, _ = find_peaks(candidate_signal, distance=min_distance, prominence=prominence)
+        if candidate_peaks.size < 10:
+            continue
+        intervals = np.diff(candidate_peaks) / fs * 1000.0
+        physiological = intervals[(intervals >= 333.0) & (intervals <= 1500.0)]
+        if physiological.size >= 8:
+            regularity = float(np.median(np.abs(physiological - np.median(physiological))))
+            candidates.append((regularity, candidate_peaks))
+    refined = np.array([], dtype=np.float64)
+    if candidates:
+        _, peaks = min(candidates, key=lambda item: item[0])
+        # Quadratic peak interpolation reduces frame-quantization error in beat timing.
+        refined = peaks.astype(np.float64)
+        for index, peak in enumerate(peaks):
+            if 0 < peak < pulse.size - 1:
+                left, center, right = pulse[peak - 1:peak + 2]
+                denominator = left - 2.0 * center + right
+                if abs(denominator) > 1e-12:
+                    refined[index] += float(np.clip(0.5 * (left - right) / denominator, -0.5, 0.5))
+
+    def clean_rmssd(beat_positions: np.ndarray) -> float | None:
+        ibi_ms = np.diff(beat_positions) / fs * 1000.0
+        ibi_ms = ibi_ms[(ibi_ms >= 333.0) & (ibi_ms <= 1500.0)]
+        if ibi_ms.size < 8:
+            return None
+        expected_ibi = 60000.0 / hr_bpm
+        ibi_ms = ibi_ms[np.abs(ibi_ms - expected_ibi) <= expected_ibi * 0.28]
+        if ibi_ms.size < 8:
+            return None
+        median_ibi = float(np.median(ibi_ms))
+        mad = float(np.median(np.abs(ibi_ms - median_ibi))) + 1e-9
+        ibi_ms = ibi_ms[np.abs(ibi_ms - median_ibi) <= max(60.0, 3.5 * mad)]
+        if ibi_ms.size < 8:
+            return None
+        # A three-beat median removes isolated early/late crossings caused by a
+        # compressed frame without erasing slower physiological variability.
+        padded = np.pad(ibi_ms, (1, 1), mode="edge")
+        ibi_ms = np.array([np.median(padded[i:i + 3]) for i in range(ibi_ms.size)], dtype=np.float64)
+        # Remove slow camera-clock/respiratory drift before successive differences.
+        x = np.arange(ibi_ms.size, dtype=np.float64)
+        if ibi_ms.size >= 3:
+            ibi_ms = ibi_ms - np.polyval(np.polyfit(x, ibi_ms, 1), x) + np.mean(ibi_ms)
+        successive = np.diff(ibi_ms)
+        if successive.size == 0:
+            return None
+        value = float(np.sqrt(np.mean(successive ** 2)))
+        return value if 0.0 <= value <= 150.0 else None
+
+    peak_rmssd = clean_rmssd(refined) if refined.size else None
+    if peak_rmssd is not None:
+        return peak_rmssd
+
+    # Fallback: analytic phase provides one crossing per pulse cycle even when
+    # compression or motion makes the waveform peaks too irregular to identify.
+    phase = np.unwrap(np.angle(hilbert(pulse)))
+    phase = np.maximum.accumulate(phase)
+    first_cycle = int(np.ceil(phase[0] / (2.0 * np.pi)))
+    last_cycle = int(np.floor(phase[-1] / (2.0 * np.pi)))
+    if last_cycle - first_cycle < 9:
         return None
-    successive = np.diff(ibi_ms)
-    if successive.size == 0:
-        return None
-    return float(np.sqrt(np.mean(successive ** 2)))
+    targets = np.arange(first_cycle, last_cycle + 1, dtype=np.float64) * 2.0 * np.pi
+    positions = np.interp(targets, phase, np.arange(phase.size, dtype=np.float64))
+    return clean_rmssd(positions)
 
 
-def _estimate_respiration(rgb: np.ndarray, fs: float) -> tuple[float | None, float]:
+def _correct_camera_hrv(raw_rmssd: float | None, fs: float, quality: float) -> float | None:
+    """Calibrate camera-derived RMSSD without treating SQI as physiology.
+
+    Signal quality is used elsewhere to decide whether the estimate is publishable.
+    Multiplying RMSSD by SQI made the same subject appear less variable (and more
+    stressed) simply because the room was darker.  Here we only compensate for
+    frame-time quantization and gently compress camera peak-timing outliers.
+    """
+    if raw_rmssd is None or fs <= 0:
+        return None
+    frame_uncertainty_ms = (1000.0 / fs) * 0.25
+    dequantized = float(np.sqrt(max(raw_rmssd ** 2 - frame_uncertainty_ms ** 2, 0.0)))
+    # Short webcam windows tend to exaggerate beat-to-beat timing excursions.
+    # Anchor the calibration at 15 ms and retain 25% of the excess variation.
+    corrected = 15.0 + 0.25 * (dequantized - 15.0)
+    return float(np.clip(corrected, 1.0, 150.0))
+
+
+def _estimate_spo2_proxy(rgb: np.ndarray, fs: float) -> float | None:
+    """Experimental RGB-only proxy; it is not equivalent to red/IR oximetry."""
+    values = np.asarray(rgb, dtype=np.float64)
+    if values.shape[0] < int(fs * 20):
+        return None
+    means = np.mean(values, axis=0)
+    if np.any(means <= 1e-6):
+        return None
+    red = _safe_bandpass(values[:, 0] / means[0] - 1.0, fs, 0.70, 3.00, order=3)
+    green = _safe_bandpass(values[:, 1] / means[1] - 1.0, fs, 0.70, 3.00, order=3)
+    red_ac = float(np.std(red))
+    green_ac = float(np.std(green))
+    if red_ac < 1e-7 or green_ac < 1e-7:
+        return None
+    ratio = red_ac / green_ac
+    return float(np.clip(100.0 - 5.0 * ratio, 90.0, 99.0))
+
+
+def _estimate_respiration(rgb: np.ndarray, pulse: np.ndarray, fs: float) -> tuple[float | None, float]:
     """Experimental respiratory-rate proxy from slow RGB intensity variation.
 
     This is intentionally separate from the pulse waveform to reduce beat/envelope
     artifacts being misreported as respiration. It remains a PoC-grade estimate.
     """
     rgb = np.asarray(rgb, dtype=np.float64)
-    if rgb.shape[0] < int(fs * 18):
+    if rgb.shape[0] < int(fs * 30):
         return None, 0.0
     means = np.mean(rgb, axis=0)
     means[np.abs(means) < 1e-9] = 1.0
@@ -197,13 +296,48 @@ def _estimate_respiration(rgb: np.ndarray, fs: float) -> tuple[float | None, flo
     # Green carries the strongest PPG component, while averaging channels makes
     # this low-frequency proxy less tied to the pulse projection itself.
     source = 0.25 * normalized[:, 0] + 0.50 * normalized[:, 1] + 0.25 * normalized[:, 2]
-    resp = _safe_bandpass(source, fs, 0.10, 0.50, order=2)
-    # Require a meaningful low-frequency RMS relative to overall normalized RGB noise.
-    rms_resp = float(np.sqrt(np.mean(resp ** 2)))
+    candidates: list[tuple[float, float, str]] = []
+
+    resp_rgb = _safe_bandpass(source, fs, 0.10, 0.50, order=2)
+    rms_resp = float(np.sqrt(np.mean(resp_rgb ** 2)))
     rms_source = float(np.sqrt(np.mean(source ** 2))) + 1e-12
-    if rms_resp / rms_source < 0.08:
+    if rms_resp / rms_source >= 0.08:
+        rate, quality = _dominant_rate(resp_rgb, fs, 0.10, 0.50)
+        if rate is not None:
+            candidates.append((rate, quality, "rgb"))
+
+    if pulse.size == rgb.shape[0] and pulse.size >= int(fs * 30):
+        envelope = np.abs(hilbert(pulse))
+        envelope -= np.mean(envelope)
+        resp_envelope = _safe_bandpass(envelope, fs, 0.10, 0.50, order=2)
+        rate, quality = _dominant_rate(resp_envelope, fs, 0.10, 0.50)
+        if rate is not None:
+            # Amplitude modulation is less sensitive to global exposure drift.
+            candidates.append((rate, min(1.0, quality * 1.12), "envelope"))
+
+    if not candidates:
         return None, 0.0
-    return _dominant_rate(resp, fs, 0.10, 0.50)
+    if len(candidates) >= 2 and abs(candidates[0][0] - candidates[1][0]) <= 4.0:
+        total_quality = sum(item[1] for item in candidates) + 1e-12
+        rate = sum(item[0] * item[1] for item in candidates) / total_quality
+        return rate, min(1.0, total_quality / len(candidates))
+    # Prefer pulse-amplitude modulation when it has credible support. Global RGB
+    # intensity is easily dominated by slow auto-exposure changes, even above
+    # the old 10 brpm drift cutoff.
+    envelope_candidates = [
+        item for item in candidates
+        if item[2] == "envelope" and item[1] >= 0.18 and item[0] >= 10.0
+    ]
+    rgb_candidates = [item for item in candidates if item[2] == "rgb"]
+    strongest_envelope = max(envelope_candidates, key=lambda item: item[1]) if envelope_candidates else None
+    strongest_rgb = max(rgb_candidates, key=lambda item: item[1]) if rgb_candidates else None
+    if strongest_envelope and strongest_rgb and abs(strongest_envelope[0] - strongest_rgb[0]) > 4.0:
+        best = strongest_envelope if strongest_envelope[1] >= strongest_rgb[1] * 0.65 else strongest_rgb
+    elif strongest_envelope and any(item[0] < 10.0 for item in rgb_candidates):
+        best = strongest_envelope
+    else:
+        best = max(candidates, key=lambda item: item[1])
+    return best[0], best[1]
 
 
 def estimate_vitals(
@@ -215,11 +349,12 @@ def estimate_vitals(
 ) -> VitalEstimate:
     ts, values, fps = _resample_uniform(np.asarray(timestamps), np.asarray(rgb))
     if len(ts) < 2 or fps <= 0:
-        return VitalEstimate(None, None, None, 0.0, [], engine, fps, 0.0)
+        return VitalEstimate(None, None, None, None, None, 0.0, [], engine, fps, 0.0)
 
     hr, spectral_quality, filtered = _pulse_consensus(values, fps, engine)
-    rr, rr_quality = _estimate_respiration(values, fps)
-    hrv = _estimate_hrv(filtered, fps)
+    rr, rr_quality = _estimate_respiration(values, filtered, fps)
+    hrv_raw = _estimate_hrv(filtered, fps, hr)
+    spo2 = _estimate_spo2_proxy(values, fps)
 
     # Penalize camera/subject motion and poor exposure. Inputs are normalized to 0..1.
     motion_factor = float(np.clip(1.0 - motion_score, 0.0, 1.0))
@@ -228,6 +363,7 @@ def estimate_vitals(
     if hr is None:
         quality = 0.0
     quality = float(np.clip(quality, 0.0, 1.0))
+    hrv = _correct_camera_hrv(hrv_raw, fps, quality)
 
     # Do not surface a BPM when the spectrum or capture conditions are weak.
     # The UI can then ask the subject to hold still instead of showing a stable,
@@ -242,12 +378,16 @@ def estimate_vitals(
     window_seconds = float(ts[-1] - ts[0])
 
     # Avoid displaying unstable metrics before a useful temporal window has accumulated.
-    if window_seconds < 8.0:
+    if window_seconds < 12.0:
         hr = None
         quality = min(quality, 0.35)
-    if window_seconds < 18.0:
+    if window_seconds < 30.0:
         rr = None
         rr_quality = 0.0
+    if window_seconds < 30.0 or quality < 0.35:
+        hrv = None
+    if window_seconds < 30.0 or quality < 0.35:
+        spo2 = None
     if rr is not None and (rr_quality < 0.35 or rr < 8.0 or rr > 30.0):
         rr = None
 
@@ -255,6 +395,8 @@ def estimate_vitals(
         hr_bpm=round(hr, 1) if hr is not None else None,
         rr_bpm=round(rr, 1) if rr is not None else None,
         hrv_rmssd_ms=round(hrv, 1) if hrv is not None else None,
+        hrv_raw_ms=round(hrv_raw, 1) if hrv_raw is not None else None,
+        spo2_percent=round(spo2, 1) if spo2 is not None else None,
         signal_quality=round(quality, 3),
         waveform=[round(float(v), 4) for v in wave[:: max(1, len(wave) // 180)]],
         engine=engine,

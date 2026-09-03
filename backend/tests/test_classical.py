@@ -1,6 +1,6 @@
 import numpy as np
 
-from app.engines.classical import estimate_vitals
+from app.engines.classical import _correct_camera_hrv, estimate_vitals
 
 
 def synthetic_rgb(hr_bpm=72.0, fps=30.0, seconds=24.0):
@@ -66,9 +66,15 @@ def test_short_window_hides_hr():
     result = estimate_vitals(ts, rgb, engine="chrom")
     assert result.hr_bpm is None
 
+
+def test_short_window_hides_experimental_hrv():
+    ts, rgb = synthetic_rgb(seconds=24.0)
+    result = estimate_vitals(ts, rgb, engine="chrom")
+    assert result.hrv_rmssd_ms is None
+
 def test_respiration_proxy_detects_slow_modulation():
     fps = 30.0
-    seconds = 24.0
+    seconds = 45.0
     t = np.arange(0, seconds, 1.0 / fps)
     pulse = np.sin(2 * np.pi * (72.0 / 60.0) * t)
     resp = np.sin(2 * np.pi * (15.0 / 60.0) * t)
@@ -78,3 +84,40 @@ def test_respiration_proxy_detects_slow_modulation():
     result = estimate_vitals(t.tolist(), np.column_stack([r, g, b]).tolist(), engine="chrom")
     assert result.rr_bpm is not None
     assert abs(result.rr_bpm - 15.0) <= 2.0
+
+
+def test_long_clean_signal_produces_hrv_and_spo2_proxies():
+    ts, rgb = synthetic_rgb(seconds=45.0)
+    result = estimate_vitals(ts, rgb, engine="chrom")
+    assert result.hrv_rmssd_ms is not None
+    assert result.spo2_percent is not None
+    assert 90.0 <= result.spo2_percent <= 99.0
+    assert result.hrv_rmssd_ms < 30.0
+
+
+def test_respiration_prefers_pulse_envelope_over_slow_light_drift():
+    fps = 30.0
+    seconds = 45.0
+    t = np.arange(0, seconds, 1.0 / fps)
+    envelope = 1.0 + 0.22 * np.sin(2 * np.pi * (20.0 / 60.0) * t)
+    pulse = envelope * np.sin(2 * np.pi * (84.0 / 60.0) * t)
+    light_drift = 0.65 * np.sin(2 * np.pi * (9.0 / 60.0) * t)
+    r = 155.0 + 0.55 * pulse + light_drift
+    g = 118.0 + 1.10 * pulse + light_drift
+    b = 103.0 + 0.35 * pulse + light_drift
+    result = estimate_vitals(t, np.column_stack([r, g, b]), engine="chrom")
+
+    assert result.rr_bpm is not None
+    assert abs(result.rr_bpm - 20.0) <= 3.0
+
+
+def test_camera_hrv_correction_reduces_frame_jitter_inflation():
+    corrected = _correct_camera_hrv(raw_rmssd=70.0, fs=25.0, quality=0.5)
+    assert corrected is not None
+    assert 27.0 <= corrected <= 31.0
+
+
+def test_camera_hrv_value_does_not_change_with_lighting_quality():
+    dim = _correct_camera_hrv(raw_rmssd=55.0, fs=25.0, quality=0.4)
+    bright = _correct_camera_hrv(raw_rmssd=55.0, fs=25.0, quality=0.9)
+    assert dim == bright

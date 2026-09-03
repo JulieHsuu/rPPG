@@ -13,6 +13,7 @@ class VisionSample:
     motion_score: float
     exposure_score: float
     roi_pixels: int
+    roi_quality: float = 0.0
 
 
 class FaceROIExtractor:
@@ -27,6 +28,7 @@ class FaceROIExtractor:
         if self.detector.empty():
             raise RuntimeError(f"Unable to load OpenCV face cascade: {cascade_path}")
         self.last_bbox: tuple[int, int, int, int] | None = None
+        self.last_face_gray: np.ndarray | None = None
         self.frames_since_detection = 999
 
     @staticmethod
@@ -84,6 +86,33 @@ class FaceROIExtractor:
         mask = ((cr >= 130) & (cr <= 180) & (cb >= 75) & (cb <= 140)).astype(np.uint8) * 255
         return mask
 
+    def _texture_motion(self, gray: np.ndarray, bbox: tuple[int, int, int, int]) -> float:
+        """Measure motion inside the face, not only movement of the detector box."""
+        x, y, w, h = bbox
+        face = gray[max(0, y):y + h, max(0, x):x + w]
+        if face.size == 0:
+            self.last_face_gray = None
+            return 1.0
+        face = cv2.resize(face, (96, 96), interpolation=cv2.INTER_AREA).astype(np.float32)
+        # Normalization makes the score less sensitive to a global exposure step.
+        face = (face - float(np.mean(face))) / (float(np.std(face)) + 1e-6)
+        previous = self.last_face_gray
+        self.last_face_gray = face
+        if previous is None:
+            return 0.0
+        difference = float(np.median(np.abs(face - previous)))
+        return float(np.clip(difference / 0.65, 0.0, 1.0))
+
+    @staticmethod
+    def _trimmed_rgb_mean(rgb_pixels: np.ndarray) -> np.ndarray:
+        """Reject highlights and deep shadows before averaging a skin region."""
+        if rgb_pixels.shape[0] < 20:
+            return np.mean(rgb_pixels, axis=0)
+        low, high = np.percentile(rgb_pixels, [10, 90], axis=0)
+        keep = np.all((rgb_pixels >= low) & (rgb_pixels <= high), axis=1)
+        selected = rgb_pixels[keep]
+        return np.mean(selected if selected.shape[0] >= 20 else rgb_pixels, axis=0)
+
     def sample(self, frame_bgr: np.ndarray) -> VisionSample:
         h_img, w_img = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -91,13 +120,16 @@ class FaceROIExtractor:
         detected_bbox = self._detect_face(gray)
         if detected_bbox is None:
             self.last_bbox = None
+            self.last_face_gray = None
             return VisionSample(None, None, 1.0, 0.0, 0)
 
         previous_bbox = self.last_bbox
-        motion = self._motion(previous_bbox, detected_bbox)
+        bbox_motion = self._motion(previous_bbox, detected_bbox)
         bbox = self._smooth_bbox(previous_bbox, detected_bbox)
         x, y, w, h = bbox
         self.last_bbox = bbox
+        texture_motion = self._texture_motion(gray, bbox)
+        motion = float(np.clip(max(bbox_motion, texture_motion), 0.0, 1.0))
 
         # Three rPPG-friendly rectangles: forehead + left/right cheeks.
         rects = [
@@ -107,7 +139,9 @@ class FaceROIExtractor:
         ]
 
         pixels = []
+        roi_means = []
         exposure_vals = []
+        valid_coverages = []
         for rect in rects:
             x1, y1, x2, y2 = self._clip_rect(*rect, w_img, h_img)
             if x2 <= x1 or y2 <= y1:
@@ -123,21 +157,34 @@ class FaceROIExtractor:
                 valid = (luminance > 35) & (luminance < 245)
             if np.count_nonzero(valid) < 30:
                 continue
-            pixels.append(rgb[valid].reshape(-1, 3))
+            valid_pixels = rgb[valid].reshape(-1, 3).astype(np.float64)
+            pixels.append(valid_pixels)
+            roi_means.append(self._trimmed_rgb_mean(valid_pixels))
             exposure_vals.append(luminance[valid])
+            valid_coverages.append(float(np.count_nonzero(valid)) / float(valid.size))
 
         if not pixels:
             return VisionSample(None, bbox, motion, 0.0, 0)
 
         all_pixels = np.vstack(pixels).astype(np.float64)
         all_lum = np.concatenate(exposure_vals).astype(np.float64)
-        rgb_mean = tuple(float(v) for v in np.mean(all_pixels, axis=0))
+        roi_array = np.vstack(roi_means)
+        # Equal ROI weighting prevents one large cheek/highlight from dominating.
+        rgb_mean = tuple(float(v) for v in np.median(roi_array, axis=0))
 
         median_lum = float(np.median(all_lum))
         dark_penalty = np.clip((median_lum - 35.0) / 55.0, 0.0, 1.0)
         bright_penalty = np.clip((245.0 - median_lum) / 55.0, 0.0, 1.0)
         spread = float(np.std(all_lum))
         contrast_factor = float(np.clip(spread / 18.0, 0.4, 1.0))
-        exposure = float(np.clip(min(dark_penalty, bright_penalty) * contrast_factor, 0.0, 1.0))
+        skin_coverage = float(np.clip(np.mean(valid_coverages) / 0.45, 0.0, 1.0))
+        if roi_array.shape[0] > 1:
+            normalized = roi_array / (np.mean(roi_array, axis=1, keepdims=True) + 1e-9)
+            roi_spread = float(np.mean(np.std(normalized, axis=0)))
+            roi_consistency = float(np.clip(1.0 - roi_spread / 0.16, 0.0, 1.0))
+        else:
+            roi_consistency = 0.45
+        roi_quality = float(np.clip(skin_coverage * roi_consistency, 0.0, 1.0))
+        exposure = float(np.clip(min(dark_penalty, bright_penalty) * contrast_factor * (0.65 + 0.35 * roi_quality), 0.0, 1.0))
 
-        return VisionSample(rgb_mean, bbox, motion, exposure, int(all_pixels.shape[0]))
+        return VisionSample(rgb_mean, bbox, motion, exposure, int(all_pixels.shape[0]), roi_quality)
